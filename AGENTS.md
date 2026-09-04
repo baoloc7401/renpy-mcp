@@ -23,10 +23,31 @@ the repo is reference material for humans.
 
 ## Default folder
 
-By default games live at `<cwd>/games/<slug>/`. The server auto-scaffolds
-a starter project at `<cwd>/games/default/` if you never call
-`new_project`. Prefer calling `new_project` with a slug derived from the
-prompt so each conversation lands in its own directory.
+By default games live at `<cwd>/games/<slug>/`, created only when you
+call `new_project` — unless `<cwd>` is itself already a Ren'Py project
+root (has `game/script.rpy`), in which case the server binds to `<cwd>`
+directly instead, with no write. Prefer calling `new_project` with a
+slug derived from the prompt so each conversation lands in its own
+directory.
+
+**If neither of those applies, the server starts with no project
+bound and creates nothing on its own.** Every tool except `new_project`
+and `bind_project` returns `{"error": "no project bound", ...}` until
+you call one of them — call `new_project(name=...)` first when starting
+from a blank prompt. (This server is sometimes installed at global/user
+MCP scope, meaning it attaches to whatever directory a session happens
+to be opened in; it deliberately never scaffolds a project into that
+directory without being asked to.)
+
+**Working against an existing large project?** If `get_project_overview`
+or `get_scaffold_status` (`is_default_project: true`) shows you're bound
+to the `games/default/` fallback instead of the repo's real game, call
+`bind_project(path="<repo_root>")` — it binds directly to any directory
+containing `game/script.rpy`, no `games/<slug>/` layout required, and it
+never scaffolds (errors instead, pointing at `new_project`, if the path
+isn't already a real project). The server-launch flags `--project` /
+`$RENPY_MCP_PROJECT_ROOT` do the same thing at startup if you control
+how the server is launched.
 
 ## Happy path from a one-sentence prompt
 
@@ -114,9 +135,9 @@ what you need — structured tools catch more mistakes.
 
 ## Tool surface size for small models
 
-If you're a low-tier model getting confused by 80 tools, ask the human
+If you're a low-tier model getting confused by 81 tools, ask the human
 operator to start the server with `--tiers 1,3`. That keeps the reads
-and the high-level intents (43 tools total) while hiding the 27 Tier 2
+and the high-level intents (44 tools total) while hiding the 27 Tier 2
 primitives that overlap with composers. The intents call the writer
 pipeline directly so authoring still works end-to-end.
 

@@ -126,19 +126,25 @@ async def test_read_raw_file_happy_and_traversal(registry):
 )
 async def test_get_lint_report_runs(registry):
     out = parse(await registry.call("get_lint_report", {}))
-    assert "stdout" in out
     assert "returncode" in out
-    # Structured-findings shape: every lint run, even a clean one, returns
-    # the same envelope. Agents can dispatch on `clean` without parsing
-    # stdout text.
-    assert "findings" in out and isinstance(out["findings"], list)
+    # Structured shape: every lint run, even a clean one, returns the same
+    # envelope. Agents can dispatch on `clean` without parsing stdout text.
+    assert "patterns" in out and isinstance(out["patterns"], list)
+    assert "findings_count" in out
     assert "summary" in out and "errors" in out["summary"]
     assert "clean" in out
+    # Raw stdout/findings are the include_raw escape hatch, not the default.
+    assert "stdout" not in out
+    assert "findings" not in out
+
+    raw = parse(await registry.call("get_lint_report", {"include_raw": True}))
+    assert "stdout" in raw
+    assert "findings" in raw and isinstance(raw["findings"], list)
 
 
 async def test_get_lint_report_parses_findings_from_stubbed_sdk(registry, monkeypatch):
     """Stub the SDK invocation so this test runs without RENPY_SDK and
-    pins the shape of the parsed findings end-to-end."""
+    pins the shape of the aggregated patterns end-to-end."""
     from renpy_mcp import sdk as renpy_sdk
 
     sample = (
@@ -162,17 +168,80 @@ async def test_get_lint_report_parses_findings_from_stubbed_sdk(registry, monkey
     out = parse(await registry.call("get_lint_report", {}))
     assert out["clean"] is False
     assert out["summary"] == {"errors": 1, "warnings": 0, "info": 0, "obsolete": 0}
-    assert len(out["findings"]) == 1
-    finding = out["findings"][0]
-    assert finding["file"] == "game/script.rpy"
-    assert finding["line"] == 5
-    assert finding["severity"] == "error"
-    assert "nonexistent" in finding["message"]
+    assert out["findings_count"] == 1
+    assert out["pattern_count"] == 1
+    assert out["patterns_truncated"] is False
+    assert len(out["patterns"]) == 1
+    group = out["patterns"][0]
+    assert group["count"] == 1
+    assert group["severity"] == "error"
+    assert "nonexistent" in group["pattern"]
+    assert "'{value}'" in group["pattern"]  # 'nowhere' collapsed to a placeholder
+    example = group["examples"][0]
+    assert example["file"] == "game/script.rpy"
+    assert example["line"] == 5
+    assert "nonexistent" in example["message"]
     assert any("config.check_conflicting" in a for a in out["advisories"])
 
 
-async def test_get_lint_report_include_raw_false_drops_stdout(registry, monkeypatch):
-    """Pass include_raw=false to keep responses small in fast iteration loops."""
+async def test_get_lint_report_groups_repeated_pattern_and_caps_examples(registry, monkeypatch):
+    """The exact reported scenario: one message pattern repeated on nearly
+    every line, differing only in the quoted name. Must collapse to a
+    single `patterns` entry with an accurate count and a capped example
+    list, not one `findings` entry per occurrence."""
+    from renpy_mcp import sdk as renpy_sdk
+
+    names = ["jennifer", "erica", "stephanie", "mc.name", "the_person"] * 20  # 100 lines
+    lines = [
+        f"game/script.rpy:{i + 1} Could not evaluate '{name}' in the who part of a say statement."
+        for i, name in enumerate(names)
+    ]
+    sample = "\n".join(lines) + "\n\nStatistics:\n\n0 errors, 100 warnings.\n"
+
+    async def fake_run_lint(_sdk, _proj):
+        return renpy_sdk.SDKResult(returncode=0, stdout=sample, stderr="")
+
+    monkeypatch.setattr(renpy_sdk, "run_lint", fake_run_lint)
+
+    out = parse(await registry.call("get_lint_report", {}))
+    assert out["findings_count"] == 100
+    assert out["pattern_count"] == 1
+    assert len(out["patterns"]) == 1
+    group = out["patterns"][0]
+    assert group["count"] == 100
+    assert group["severity"] == "warning"
+    # Capped at 5 examples even though 100 lines matched.
+    assert len(group["examples"]) == 5
+    # The response as a whole must be small — this is the actual bug: a
+    # naive dump of 100 near-identical findings vs. one grouped summary.
+    import json as _json
+    assert len(_json.dumps(out)) < 5000
+
+
+async def test_get_lint_report_surfaces_bare_exception_with_useful_message(registry, monkeypatch):
+    """A bare `NotImplementedError()` (empty `str(exc)`) — the exact
+    failure asyncio subprocess creation raises on some Windows hosts — must
+    not produce an unusable blank error message. It must also name the
+    launcher the *current platform* actually resolves to, not a hardcoded
+    `renpy.sh`."""
+    from renpy_mcp import sdk as renpy_sdk
+    from renpy_mcp.config import sdk_launcher_name
+
+    async def fake_run_lint(_sdk, _proj):
+        raise NotImplementedError()
+
+    monkeypatch.setattr(renpy_sdk, "run_lint", fake_run_lint)
+
+    out = parse(await registry.call("get_lint_report", {}))
+    assert "error" in out
+    assert out["error"] != f"failed to invoke {sdk_launcher_name()} lint: "
+    assert "NotImplementedError" in out["error"]
+    assert sdk_launcher_name() in out["error"]
+
+
+async def test_get_lint_report_default_omits_raw_and_flat_findings(registry, monkeypatch):
+    """Default (no args) must NOT include the flat findings list or raw
+    stdout/stderr/statistics — those are the include_raw escape hatch."""
     from renpy_mcp import sdk as renpy_sdk
 
     async def fake_run_lint(_sdk, _proj):
@@ -180,10 +249,31 @@ async def test_get_lint_report_include_raw_false_drops_stdout(registry, monkeypa
 
     monkeypatch.setattr(renpy_sdk, "run_lint", fake_run_lint)
 
-    out = parse(await registry.call("get_lint_report", {"include_raw": False}))
+    out = parse(await registry.call("get_lint_report", {}))
     assert "stdout" not in out
     assert "stderr" not in out
     assert "statistics" not in out
+    assert "findings" not in out
+    assert "patterns" in out
+
+
+async def test_get_lint_report_include_raw_true_restores_flat_findings(registry, monkeypatch):
+    """`include_raw: true` is the explicit escape hatch back to the full,
+    ungrouped view — findings list plus raw stdout/stderr/statistics."""
+    from renpy_mcp import sdk as renpy_sdk
+
+    sample = "game/script.rpy:5 The jump is to nonexistent label 'nowhere'.\n"
+
+    async def fake_run_lint(_sdk, _proj):
+        return renpy_sdk.SDKResult(returncode=0, stdout=sample, stderr="")
+
+    monkeypatch.setattr(renpy_sdk, "run_lint", fake_run_lint)
+
+    out = parse(await registry.call("get_lint_report", {"include_raw": True}))
+    assert "stdout" in out
+    assert "stderr" in out
+    assert "findings" in out and len(out["findings"]) == 1
+    assert "patterns" in out  # grouped view still present alongside the raw one
     assert "findings" in out
 
 

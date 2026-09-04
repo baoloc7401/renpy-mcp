@@ -326,7 +326,11 @@ def build_app(project_root: Path, sdk_root: Path, static_dir: Path | None = None
 
     @app.get("/api/lint")
     async def lint() -> Any:
-        return await state.client.call("get_lint_report")
+        # The frontend's own `lib/lint.ts` parses `stdout` client-side, so
+        # it needs the include_raw escape hatch — the default response
+        # (patterns grouped by message, no raw stdout) is for MCP callers,
+        # not this endpoint.
+        return await state.client.call("get_lint_report", {"include_raw": True})
 
     # ---------- write endpoints ----------
 

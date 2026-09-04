@@ -13,6 +13,14 @@ tool calls it and folds the result alongside the raw stdout.
 Severity inference is heuristic: Ren'Py does not tag findings, so we map
 common phrasing to error / warning / info. Wrong inferences shouldn't
 break agent loops because the raw message is preserved verbatim.
+
+`aggregate_findings` is a second pass over the parsed findings: a large
+project can have the same root cause flagged on thousands of individual
+lines (a dynamic say-tag lint can't resolve, say), and returning every
+one of those blows past any reasonable tool-output size for zero extra
+signal. It groups by normalized message pattern (quoted substrings
+replaced with a placeholder) and returns counts + a few example
+locations per pattern instead.
 """
 
 from __future__ import annotations
@@ -248,6 +256,92 @@ def parse_lint_output(stdout: str) -> dict[str, Any]:
     }
 
 
+_SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
+# Any single- or double-quoted substring becomes a placeholder before
+# grouping, so `Could not evaluate 'the_person' in the who part of a say
+# statement.` and `Could not evaluate 'stephanie' in the who part of a
+# say statement.` collapse to the same pattern. Non-greedy, no embedded
+# newline (findings are already flattened to one line by `parse_lint_output`).
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_PLACEHOLDER = "'{value}'"
+
+DEFAULT_PATTERN_LIMIT = 40
+DEFAULT_EXAMPLES_PER_PATTERN = 5
+
+
+def normalize_finding_message(message: str) -> str:
+    """Collapse a lint message to its template, replacing every quoted
+    substring with a placeholder. This is the grouping key `aggregate_findings`
+    uses — it's what lets a repeated pattern (a script-wide dynamic
+    character binding, say) collapse to one entry instead of one per
+    dialogue line."""
+    return _QUOTED_RE.sub(_PLACEHOLDER, message)
+
+
+def aggregate_findings(
+    findings: list[dict[str, Any]],
+    *,
+    pattern_limit: int = DEFAULT_PATTERN_LIMIT,
+    examples_per_pattern: int = DEFAULT_EXAMPLES_PER_PATTERN,
+) -> dict[str, Any]:
+    """Group findings by normalized message pattern.
+
+    A lint run over a large project can produce tens of thousands of
+    findings that are really the same root cause repeated once per
+    occurrence (one mistyped/dynamic say-tag flagged on every line it's
+    used, say) — returning every single one blows past any reasonable
+    tool-output size. Grouping collapses that to one entry per distinct
+    *pattern*, each carrying a count and a handful of concrete example
+    locations, so the response stays small regardless of how repetitive
+    the underlying findings are.
+
+    Returns:
+        {
+          "patterns": [
+              {"pattern", "rule", "severity", "count",
+               "examples": [{file, line, message}, ...]},
+              ...
+          ],  # sorted by (severity, then count desc) — most severe and
+              # most common noise sources surface first; capped at
+              # `pattern_limit` entries
+          "pattern_count": total distinct patterns found (pre-cap),
+          "truncated": True if `pattern_count` > `pattern_limit`,
+        }
+
+    Each `examples` list is capped at `examples_per_pattern` entries but
+    `count` always reflects the true total for that pattern, capped or not.
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for f in findings:
+        pattern = normalize_finding_message(f["message"])
+        group = groups.get(pattern)
+        if group is None:
+            group = {
+                "pattern": pattern,
+                "rule": f["rule"],
+                "severity": f["severity"],
+                "count": 0,
+                "examples": [],
+            }
+            groups[pattern] = group
+        group["count"] += 1
+        if len(group["examples"]) < examples_per_pattern:
+            group["examples"].append(
+                {"file": f["file"], "line": f["line"], "message": f["message"]}
+            )
+
+    ordered = sorted(
+        groups.values(),
+        key=lambda g: (_SEVERITY_RANK.get(g["severity"], 99), -g["count"]),
+    )
+    pattern_count = len(ordered)
+    return {
+        "patterns": ordered[:pattern_limit],
+        "pattern_count": pattern_count,
+        "truncated": pattern_count > pattern_limit,
+    }
+
+
 def _has_summary(line: str) -> bool:
     if "error" not in line.lower():
         return False
@@ -266,4 +360,4 @@ def _capture_summary(line: str) -> tuple[dict[str, int], str]:
     return counts, line.strip()
 
 
-__all__ = ["parse_lint_output"]
+__all__ = ["parse_lint_output", "aggregate_findings", "normalize_finding_message"]

@@ -6,10 +6,12 @@ boilerplate every Ren'Py game relies on. Falls back to a tiny hand-written
 skeleton when the SDK is missing or its template can't be found, so CI and
 tests that don't have the SDK still work.
 
-The server calls this at startup when ``--project`` is omitted (so the index
-has something valid to scan) and ``new_project`` calls it to spin up fresh
-games on demand. Everything beyond ``label start`` is expected to be added
-through the tiered tool surface.
+Only ever called for an explicit, user-initiated target: at startup when
+``--project``/``$RENPY_MCP_PROJECT_ROOT`` names a path that doesn't exist
+yet, and by the ``new_project``/``bind_project`` tools. The server never
+calls this on its own initiative — there is no implicit "scaffold
+whatever cwd happens to be" fallback. Everything beyond ``label start``
+is expected to be added through the tiered tool surface.
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ from __future__ import annotations
 import re
 import shutil
 from pathlib import Path
+
+from . import recent as recent_buffer
 
 _MIN_SCRIPT_RPY = """\
 # Entry point. The `start` label runs first when the player clicks
@@ -110,14 +114,31 @@ def scaffold_project(
         # crashes at startup as soon as it's distributed. See
         # project/scaffold_health.py for the full story.
         _slim_guisupport(game / "guisupport.rpy")
-        return f"scaffolded {root} from SDK template"
+        summary = f"scaffolded {root} from SDK template"
+        _record_scaffold(root, game, summary)
+        return summary
 
     (game / "script.rpy").write_text(_MIN_SCRIPT_RPY, encoding="utf-8")
     (game / "options.rpy").write_text(
         _MIN_OPTIONS_RPY.format(name=display_name or root.name),
         encoding="utf-8",
     )
-    return f"scaffolded {root} (minimal skeleton; no SDK template found)"
+    summary = f"scaffolded {root} (minimal skeleton; no SDK template found)"
+    _record_scaffold(root, game, summary)
+    return summary
+
+
+def _record_scaffold(root: Path, game: Path, summary: str) -> None:
+    """Log a whole-directory scaffold write to the same audited ring buffer
+    ``apply_write`` uses for single-file edits (``get_recent_edits`` reads
+    both), so a fresh project's creation is never invisible to an agent
+    asking "what just got written." A unified diff doesn't fit a directory
+    copy, so ``diff`` carries a manifest of every file this call created
+    instead.
+    """
+    created = sorted(p.relative_to(root).as_posix() for p in game.rglob("*") if p.is_file())
+    manifest = "\n".join(f"+ {rel}" for rel in created)
+    recent_buffer.record(file=str(game.relative_to(root)), summary=summary, diff=manifest)
 
 
 def _copy_template(src: Path, dst: Path) -> None:

@@ -19,8 +19,12 @@ from pathlib import Path
 
 from ..config import ServerConfig
 
-# Header line patterns. We only care about column-zero declarations because
-# nested labels/screens are vanishingly rare and not worth the complexity.
+# Header line patterns. Most are only recognized at column zero — nested
+# labels/transforms/etc. are vanishingly rare and not worth the complexity
+# of modeling every enclosing block shape. `screen` is the documented
+# exception: `_scan_file` matches screen headers at any indentation because
+# real projects commonly nest screen declarations inside `init N:` blocks
+# (to control creation order), which this scanner otherwise ignores.
 _LABEL_RE = re.compile(r"^label\s+([A-Za-z_]\w*)\s*(?:\([^)]*\))?\s*:")
 _CHARACTER_RE = re.compile(
     r"^define\s+([A-Za-z_]\w*)\s*=\s*Character\s*\(\s*(?P<args>.*?)\)\s*$"
@@ -30,7 +34,7 @@ _DEFINE_RE = re.compile(r"^define\s+([A-Za-z_][\w.]*)\s*=\s*(.+?)\s*$")
 _IMAGE_RE = re.compile(r"^image\s+(?P<name>[\w ]+?)\s*=\s*(?P<value>.+?)\s*$")
 _LAYEREDIMAGE_RE = re.compile(r"^layeredimage\s+([A-Za-z_]\w*)\s*:")
 _TRANSFORM_RE = re.compile(r"^transform\s+([A-Za-z_]\w*)\s*(?:\([^)]*\))?\s*:")
-_SCREEN_RE = re.compile(r"^screen\s+([A-Za-z_]\w*)\s*(?:\([^)]*\))?\s*:")
+_SCREEN_NAME_RE = re.compile(r"^screen\s+([A-Za-z_]\w*)\b")
 _PLAY_RE = re.compile(r"^\s*play\s+(\w+)\s+(\".+?\"|'.+?')")
 # A say-statement reference inside a label, used only to produce a line-count
 # heuristic in the overview. Catches both `e "text"` and `"Name" "text"`.
@@ -200,6 +204,36 @@ def _scan_audio_plays(rel: str, lines: list[str], audio_plays: list[AudioPlayInf
             )
 
 
+def _parse_screen_header(stripped: str) -> str | None:
+    """Match a `screen NAME(...):` / `screen NAME:` header line.
+
+    Written by hand rather than as a single regex because the parameter
+    list can itself contain parentheses — tuple default values like
+    `given_align = (0.0, 0.0)` are common in this codebase's screens — and
+    a non-recursive regex can't balance those. The previous
+    `\\([^)]*\\)` pattern stopped at the FIRST `)`, so it silently failed
+    to match (and the declaration went undetected) whenever a default
+    value contained one.
+    """
+    m = _SCREEN_NAME_RE.match(stripped)
+    if not m:
+        return None
+    rest = stripped[m.end() :].lstrip()
+    if rest.startswith("("):
+        depth = 0
+        for i, ch in enumerate(rest):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    rest = rest[i + 1 :]
+                    break
+        else:
+            return None  # unbalanced/multi-line parameter list on this line
+    return m.group(1) if rest.lstrip().startswith(":") else None
+
+
 def _scan_file(
     rel: str,
     lines: list[str],
@@ -219,6 +253,26 @@ def _scan_file(
         line = lines[i]
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
+
+        # `screen X(...):` is matched at ANY indentation, not just column
+        # zero — Ren'Py projects commonly nest screen declarations inside
+        # `init N:` blocks (to control creation order), and this scanner
+        # doesn't model `init N:` as a block construct at all, so a
+        # column-zero-only match silently missed every such declaration.
+        # `_block_end` already derives the block's extent from the
+        # header's own indent, so it needs no changes to handle this.
+        if stripped:
+            screen_name = _parse_screen_header(stripped)
+            if screen_name is not None:
+                end = _block_end(lines, i)
+                screens.append(
+                    ScreenInfo(
+                        name=screen_name,
+                        range=SourceRange(file=rel, start_line=i + 1, end_line=end + 1),
+                    )
+                )
+                i = end + 1
+                continue
 
         # Block constructs at column 0.
         if indent == 0 and stripped:
@@ -253,18 +307,6 @@ def _scan_file(
                 end = _block_end(lines, i)
                 transforms.append(
                     TransformInfo(
-                        name=m.group(1),
-                        range=SourceRange(file=rel, start_line=i + 1, end_line=end + 1),
-                    )
-                )
-                i = end + 1
-                continue
-
-            m = _SCREEN_RE.match(stripped)
-            if m:
-                end = _block_end(lines, i)
-                screens.append(
-                    ScreenInfo(
                         name=m.group(1),
                         range=SourceRange(file=rel, start_line=i + 1, end_line=end + 1),
                     )

@@ -21,7 +21,7 @@ def build_server(config: ServerConfig) -> tuple[Server, ToolRegistry]:
     (when added) will invalidate it after every successful mutation.
     """
     server = Server("renpy-mcp")
-    registry = ToolRegistry()
+    registry = ToolRegistry(config)
     index = ProjectIndex(config)
 
     if 1 in config.tiers:

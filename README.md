@@ -26,7 +26,7 @@ If options 2 or 3 sound foreign, see [QUICKSTART.md](QUICKSTART.md) —
 it walks through "I've never used any of this" to "I can preview my
 own VN" in about 15 minutes.
 
-For the under-the-hood story (80 MCP tools, four tiers, a single
+For the under-the-hood story (81 MCP tools, four tiers, a single
 guarded write pipeline that keeps every edit lint-clean), keep reading.
 
 ## What it looks like
@@ -107,11 +107,24 @@ renpy-mcp                    # auto-picks the cached SDK; no flags needed
 `$RENPY_SDK`) if you already have the SDK installed. Pin a specific
 version with `--fetch-sdk --sdk-version 8.6.0`.
 
-`--project` is also optional. When omitted, the server works against
-`<cwd>/games/default/` and auto-scaffolds it on first run, so a fresh
-conversation drops into a runnable starting state. Agents should call
-`new_project` at the start of a conversation to get their own named
-subfolder — see [AGENTS.md](AGENTS.md) for the happy-path flow.
+`--project` is also optional (equivalently, set `$RENPY_MCP_PROJECT_ROOT`
+— the flag wins if both are set). Either points the server at an
+existing Ren'Py project root directly, anywhere on disk — it does not
+need to live under `games/<slug>/`. When neither is given, the server
+checks whether `<cwd>` is itself already a Ren'Py project root
+(`<cwd>/game/script.rpy` exists) and binds there directly if so.
+
+Otherwise — this matters if you install the server at **global/user MCP
+scope**, where it attaches to whatever directory a session happens to be
+opened in — the server starts **unbound** and creates nothing. It does
+not scaffold a project into `<cwd>` on its own initiative; every tool
+except `new_project`/`bind_project` returns a `"no project bound"` error
+until an agent explicitly calls one of those two. Call `new_project` at
+the start of a from-scratch conversation to scaffold a fresh, named
+project under `games/<slug>/` — see [AGENTS.md](AGENTS.md) for the
+happy-path flow. Already have a session bound to the wrong project? Call
+the `bind_project` tool mid-session instead of restarting the server —
+see [AGENTS.md](AGENTS.md#default-folder).
 
 For ready-to-paste MCP-server configs that fill in your local install's
 absolute paths, run:
@@ -150,7 +163,7 @@ older `gui/run.sh /path/to/project /path/to/sdk` still works.
 
 ## Features
 
-- **80 MCP tools across 4 tiers** (78 default + 2 opt-in) — reads,
+- **81 MCP tools across 4 tiers** (79 default + 2 opt-in) — reads,
   introspection, in-process diagnostics, lifecycle (preview / warp /
   drafting / translation scaffolding / distribute), guarded write
   primitives, high-level authoring intents (`new_project` scaffolds a
@@ -225,10 +238,20 @@ point:
 }
 ```
 
-Add `"--project", "/path/to/specific/project"` if you want to pin the
-session to an existing project; otherwise the server scaffolds
-`<cwd>/games/default/` and the agent can call `new_project` to branch
-into a named subfolder.
+Add `"--project", "/path/to/specific/project"` (or set
+`RENPY_MCP_PROJECT_ROOT` in an `"env"` block instead, if your client
+makes that easier to configure) if you want to pin the session to an
+existing project — it works for any directory containing `game/`, not
+just ones under `games/<slug>/`. Without either, the server binds
+directly to `<cwd>` when `<cwd>/game/script.rpy` already exists (e.g.
+Claude Code opened at the root of an existing Ren'Py repo); otherwise it
+starts **unbound** and writes nothing — the agent has to call
+`new_project` to scaffold a named subfolder, or `bind_project` to point
+at an existing one, before any other tool will do anything. This matters
+especially if you register `renpy-mcp` at **global/user MCP scope**
+(rather than per-project `.mcp.json`): it will attach to whatever
+directory an unrelated session happens to be opened in, and the unbound
+default keeps it from ever writing there uninvited.
 
 ### hermes-agent
 
@@ -358,7 +381,7 @@ end-to-end smoke probes.
 
 ## Status
 
-Alpha. **80 MCP tools** (78 default + 2 opt-in), **378 tests** passing in
+Alpha. **81 MCP tools** (79 default + 2 opt-in), **421 tests** passing in
 ~10 seconds. End-to-end smoke probes:
 `scripts/integration_drive.py` (40-step in-process drive: scaffold →
 author → diagnose → warp → translate → distribute) and
@@ -387,11 +410,12 @@ Deep dive in [DESIGN.md](DESIGN.md).
 
 ## Tier breakdown
 
-- **Tier 1** (default on) — 29 read tools (introspection, structured
+- **Tier 1** (default on) — 30 read tools (introspection, structured
   label-tree read, choice graph, translation coverage, in-process
-  diagnostics with sidecar suppression, plus `get_recent_edits` for
-  agent self-query of the per-process write history) + 7 lifecycle
-  tools
+  diagnostics with sidecar suppression, `get_recent_edits` for agent
+  self-query of the per-process write history, plus `bind_project` for
+  rebinding the session mid-conversation to any existing project root)
+  + 7 lifecycle tools
   (`launch_preview`, `stop_preview`, `get_preview_status`, `warp_to`,
   `set_drafting_mode`, `generate_translation_scaffolding`,
   `build_distribution`). Lifecycle tools spawn the Ren'Py SDK; the

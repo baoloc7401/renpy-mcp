@@ -87,25 +87,71 @@ you're about to change something and want to understand the invariants first.
 
 ### 1a. The default-folder convention
 
-Games live at `<cwd>/games/<slug>/` by default. The CWD is whichever
-directory the harness launched `renpy-mcp` from; that gives each
-conversation an obvious, non-shared scratch space.
+Games live at `<cwd>/games/<slug>/` by default, created only when an
+agent explicitly calls `new_project`. The CWD is whichever directory the
+harness launched `renpy-mcp` from; that gives each conversation an
+obvious, non-shared scratch space — but the server never assumes it owns
+that directory.
 
-- `--project <path>` still wins when set — the server binds to that path.
-- With no `--project`, the server defaults `project_root` to
-  `<cwd>/games/default/` and auto-scaffolds it on first run so
-  `validate()` succeeds and Tier 1/2/3 tools work immediately.
+- `--project <path>` (or `$RENPY_MCP_PROJECT_ROOT`; the flag wins if
+  both are set) wins when set — the server binds to that path directly,
+  scaffolding it in place first if `game/script.rpy` isn't there yet.
+  Neither requires the path to live under `--games-root` or follow a
+  `<slug>/` shape — this is how the server points at an existing large
+  repo whose game lives at `<repo_root>/game/` directly. Scaffolding here
+  is intentional: the operator named this exact path.
+- With no override, the server checks whether `<cwd>` is *itself*
+  already a Ren'Py project root (`<cwd>/game/script.rpy` exists) and
+  binds there directly if so — this covers the common case of launching
+  `renpy-mcp` from inside an existing project's checkout. No write
+  happens: the project is already there.
+- **Only when neither an override nor `<cwd>` itself resolves to a real
+  project, the server starts unbound — `project_root` is set but nothing
+  is scaffolded there, and `config.is_bound()` is `False`.** Every tool
+  except `new_project`/`bind_project` is gated centrally in
+  `ToolRegistry.call` and returns a `"no project bound"` error instead of
+  running. Binding then requires an explicit tool call. This replaced an
+  earlier design that auto-scaffolded `<cwd>/games/default/` on this
+  branch: at global/user MCP scope, `<cwd>` is whatever directory an
+  unrelated session happened to be opened in, so that fallback silently
+  wrote a full Ren'Py scaffold into arbitrary, unrelated git repos with
+  no user action, no disclosure, and no audit trail (the scaffold bypassed
+  `get_recent_edits` entirely, since it didn't go through `apply_write`).
+  A demo/zero-config project is still one `new_project` call away; it is
+  never created without one.
 - `--games-root <path>` overrides where `new_project` drops fresh
-  projects (defaults to `<cwd>/games/`).
+  projects (defaults to `<cwd>/games/`); it plays no part in the three
+  rules above.
 - `new_project` creates a new project under the games root and rebinds
   the session's `project_root` in place — the running server keeps its
   tiers, its lifecycle state, and its index, but subsequent calls
   operate against the new directory. This keeps the server a single
   long-lived process per conversation.
+- `bind_project` (Tier 1) is the mid-session equivalent of `--project`:
+  it rebinds `project_root` to *any* existing directory containing
+  `game/script.rpy`, with no games-root or `<slug>/` requirement, and
+  refuses to scaffold — it's for pointing an already-running session at
+  a project the startup flags missed, not for creating new ones. It
+  reuses `scaffold_project`'s idempotent already-present check rather
+  than duplicating the bind logic.
 
 The `ServerConfig.project_root` field is therefore *mutable by design*:
 the dataclass dropped `frozen=True` when the scaffold flow landed.
-`bind_project(new_root)` is the only sanctioned way to mutate it.
+`ServerConfig.bind_project(new_root)` is the only sanctioned way to
+mutate it; `new_project` and the `bind_project` tool are both thin
+wrappers around it. `ServerConfig.is_bound()` (`project_root.is_dir()`
+and `game_dir.is_dir()`) is the single source of truth the registry gate
+checks — `ServerConfig.validate(require_project=False)` is the startup
+counterpart, letting `main()` skip the project-root checks while still
+enforcing the SDK is present.
+
+Every `scaffold_project` call — startup's explicit-target case,
+`new_project`, `bind_project`'s idempotent check — records into the same
+`project/recent.py` ring buffer `apply_write` uses, as a file manifest
+rather than a unified diff (a whole-directory copy has no single-file
+diff to show). `get_recent_edits` therefore surfaces project creation
+too, not just `.rpy` edits — the earlier auto-scaffold bug was invisible
+partly *because* it bypassed this buffer entirely.
 
 ---
 
@@ -117,16 +163,17 @@ defaults to those three; Tier 4 is opt-in-only).
 
 ### Tier 1 — read + lifecycle (always safe)
 
-29 read tools + 7 lifecycle tools: project overview,
+30 read tools + 7 lifecycle tools: project overview,
 label/character/image/audio/variable/screen listing, per-entity read,
 reference search, raw file read, structured label-tree, choice graph,
 translation coverage, the in-process `find_*` diagnostics,
 `get_recent_edits`, `get_media_invariants`, `get_scaffold_status`,
-`get_lint_report`, plus lifecycle: `launch_preview`, `stop_preview`,
-`get_preview_status`, `warp_to`, `set_drafting_mode`,
+`get_lint_report`, `bind_project`, plus lifecycle: `launch_preview`,
+`stop_preview`, `get_preview_status`, `warp_to`, `set_drafting_mode`,
 `generate_translation_scaffolding`, `build_distribution`. The reads
-never write bytes; the lifecycle tools spawn the Ren'Py SDK but never
-mutate `.rpy` content.
+never write bytes; `bind_project` only rebinds session state (no `.rpy`
+mutation); the lifecycle tools spawn the Ren'Py SDK but never mutate
+`.rpy` content.
 
 ### Tier 2 — guarded write primitives (one statement per tool)
 
@@ -362,7 +409,7 @@ decision in the repo — see the root README for the rationale.
   resulting `.rpy` and assert on the bytes (not the diff), plus
   re-snapshot the index to confirm the new content parses back cleanly.
 
-The suite runs in ~10 seconds (378 tests at time of writing). Keep it
+The suite runs in ~10 seconds (421 tests at time of writing). Keep it
 that way: avoid fixtures that spawn real subprocesses when a mock will
 do. The lifecycle tests monkey-patch `asyncio.create_subprocess_exec` to
 spawn `sleep 30` instead of the real SDK, for example.

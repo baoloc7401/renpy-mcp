@@ -138,11 +138,13 @@ def evaluate(config: ServerConfig, index: ProjectIndex) -> dict[str, Any]:
                 rule="auto_scaffolded_default_project",
                 severity="info",
                 message=(
-                    "Session is bound to the auto-scaffolded `games/default/` "
-                    "fallback. Call `new_project(name=...)` to branch into a "
-                    "named subfolder before authoring."
+                    "Session is bound to the `games/default/` fallback "
+                    "project. Call `new_project(name=...)` to branch into a "
+                    "named subfolder before authoring, or — if you meant to "
+                    "work against an existing project this session missed — "
+                    "call `bind_project(path=...)` to bind directly to it."
                 ),
-                fix_hint="new_project",
+                fix_hint="new_project or bind_project",
             )
         )
 
