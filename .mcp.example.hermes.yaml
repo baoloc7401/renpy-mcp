@@ -8,7 +8,7 @@
 # to have the server emit the same block with your actual paths filled in.
 #
 # After editing, run `hermes mcp test renpy` to verify the connection —
-# you should see the renpy-mcp tool catalog (75 tools by default).
+# you should see the renpy-mcp tool catalog (79 tools by default).
 
 mcp_servers:
   renpy:
@@ -21,6 +21,11 @@ mcp_servers:
       # Optional: pin a games-root so `new_project` lands consistently.
       # - "--games-root"
       # - "/path/to/games"
+      # Optional: pin the session to an existing project (any directory
+      # containing game/ — not just one under games-root). Equivalent to
+      # setting $RENPY_MCP_PROJECT_ROOT in hermes' .env instead.
+      # - "--project"
+      # - "/path/to/specific/project"
       # Optional: tier filter. Default is 1,2,3; add 4 to unlock escape hatches.
       # - "--tiers"
       # - "1,2,3"

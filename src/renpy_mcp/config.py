@@ -46,13 +46,23 @@ class ServerConfig:
         """Switch the session to a new project root. Caller handles index refresh."""
         self.project_root = new_root.resolve()
 
-    def validate(self) -> None:
-        if not self.project_root.is_dir():
-            raise ValueError(f"project root does not exist: {self.project_root}")
-        if not self.game_dir.is_dir():
-            raise ValueError(
-                f"project root is not a Ren'Py project (no game/ subdir): {self.project_root}"
-            )
+    def validate(self, *, require_project: bool = True) -> None:
+        """Check the config is internally consistent.
+
+        ``require_project=False`` skips the project-root checks — used at
+        startup when the server intentionally begins unbound (no
+        ``--project``/``$RENPY_MCP_PROJECT_ROOT`` and ``cwd`` isn't itself a
+        Ren'Py project). ``project_root`` still holds a placeholder path in
+        that case, but nothing was written there and nothing requires it to
+        exist until ``new_project``/``bind_project`` binds for real.
+        """
+        if require_project:
+            if not self.project_root.is_dir():
+                raise ValueError(f"project root does not exist: {self.project_root}")
+            if not self.game_dir.is_dir():
+                raise ValueError(
+                    f"project root is not a Ren'Py project (no game/ subdir): {self.project_root}"
+                )
         if not self.sdk_launcher.is_file():
             raise ValueError(
                 f"SDK root missing launcher `{sdk_launcher_name()}`: {self.sdk_root}"

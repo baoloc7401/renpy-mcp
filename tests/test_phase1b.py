@@ -132,6 +132,152 @@ async def test_find_undefined_screens_flags_call_screen(workspace):
     assert "pause_menu" in out["diagnostics"][0]["message"]
 
 
+async def test_find_undefined_screens_show_with_args_resolves_bare_name(workspace):
+    """Regression: `show screen main_choice_display(build_menu_items([...`
+    used to be flagged verbatim (the whole call expression) as an
+    "undefined" screen even when `screen main_choice_display(...)` was
+    declared — the lookup must use only the identifier before `(`."""
+    cfg, reg, idx = workspace
+    extra = cfg.project_root / "game" / "extra.rpy"
+    extra.write_text(
+        "screen main_choice_display(items):\n"
+        "    vbox:\n"
+        "        for item in items:\n"
+        "            text item\n"
+        "\n"
+        "label visit:\n"
+        "    show screen main_choice_display(build_menu_items([1, 2, 3]))\n"
+        "    return\n"
+    )
+    idx.refresh()
+    out = parse(await reg.call("find_undefined_screens", {}))
+    assert out["count"] == 0
+
+
+async def test_find_undefined_screens_call_with_args_resolves_bare_name(workspace):
+    cfg, reg, idx = workspace
+    extra = cfg.project_root / "game" / "extra.rpy"
+    extra.write_text(
+        "screen confirm_screen(message):\n"
+        "    text message\n"
+        "\n"
+        "label visit:\n"
+        "    call screen confirm_screen(message=\"Are you sure?\")\n"
+        "    return\n"
+    )
+    idx.refresh()
+    out = parse(await reg.call("find_undefined_screens", {}))
+    assert out["count"] == 0
+
+
+async def test_find_undefined_screens_with_args_still_flags_missing_screen(workspace):
+    """The fix must not swallow real findings — an undeclared screen
+    referenced with call args is still undefined, just correctly named."""
+    cfg, reg, idx = workspace
+    extra = cfg.project_root / "game" / "extra.rpy"
+    extra.write_text(
+        "label visit:\n"
+        "    show screen totally_missing(build_menu_items([1, 2]))\n"
+        "    return\n"
+    )
+    idx.refresh()
+    out = parse(await reg.call("find_undefined_screens", {}))
+    assert out["count"] == 1
+    diag = out["diagnostics"][0]
+    # The lookup key in the message is the bare identifier...
+    assert "`totally_missing`" in diag["message"]
+    # ...but the full call is still surfaced for context.
+    assert "build_menu_items" in diag["message"]
+    # And the garbage old-style "name" must never appear as the identifier.
+    assert "totally_missing(build_menu_items" not in diag["message"].split("referenced as")[0]
+
+
+async def test_find_undefined_screens_resolves_trailing_transition(workspace):
+    """`show screen X with dissolve` — no parens, but a trailing clause
+    after whitespace — must still resolve to the bare name `X`."""
+    cfg, reg, idx = workspace
+    extra = cfg.project_root / "game" / "extra.rpy"
+    extra.write_text(
+        "screen fade_overlay():\n"
+        "    text 'overlay'\n"
+        "\n"
+        "label visit:\n"
+        "    show screen fade_overlay with dissolve\n"
+        "    return\n"
+    )
+    idx.refresh()
+    out = parse(await reg.call("find_undefined_screens", {}))
+    assert out["count"] == 0
+
+
+async def test_find_undefined_screens_recognizes_declaration_nested_in_init_block(workspace):
+    """Regression for the Lab Rats 2 report: `screen X(...):` declared
+    indented inside an `init N:` block (a common idiom for controlling
+    screen creation order) must still be recognized — the scanner
+    previously only matched screen headers at column zero."""
+    cfg, reg, idx = workspace
+    extra = cfg.project_root / "game" / "extra.rpy"
+    extra.write_text(
+        "init 2:\n"
+        "    screen assign_division_serum():\n"
+        "        text 'nested screen'\n"
+        "\n"
+        "label visit:\n"
+        "    call screen assign_division_serum()\n"
+        "    return\n"
+    )
+    idx.refresh()
+    out = parse(await reg.call("find_undefined_screens", {}))
+    assert out["count"] == 0
+
+
+async def test_find_undefined_screens_recognizes_declaration_with_nested_parens(workspace):
+    """Regression for the Lab Rats 2 report: a screen parameter list that
+    itself contains parentheses (e.g. a tuple default value like
+    `given_align = (0.0, 0.0)`) must still be recognized as a declaration
+    — the old `screen X(...):` regex's `[^)]*` stopped at the FIRST `)`,
+    silently failing to match (and so silently missing the declaration)
+    whenever a default value contained one."""
+    cfg, reg, idx = workspace
+    extra = cfg.project_root / "game" / "extra.rpy"
+    extra.write_text(
+        "screen trait_list_tooltip(traits, given_align = (0.0, 0.0), given_anchor = (0.0, 0.0)):\n"
+        "    text 'tooltip'\n"
+        "\n"
+        "label visit:\n"
+        "    show screen trait_list_tooltip([1, 2], given_align = (0.25, 0.45))\n"
+        "    return\n"
+    )
+    idx.refresh()
+    out = parse(await reg.call("find_undefined_screens", {}))
+    assert out["count"] == 0
+
+
+async def test_find_undefined_screens_recognizes_indented_declaration_with_nested_parens(workspace):
+    """Both fixes combined — reproduces the exact real-world shape found
+    at game/game_screens/tooltip_screens/trait_tooltip.rpy: a screen
+    declared at column zero (not indented) whose signature has nested
+    parens, immediately followed by a SECOND screen declaration whose
+    detection depends on the first one's block-end being computed
+    correctly."""
+    cfg, reg, idx = workspace
+    extra = cfg.project_root / "game" / "extra.rpy"
+    extra.write_text(
+        "screen trait_tooltip(trait, given_align = (0.0, 0.0), show_unlocks = True):\n"
+        "    text 'first tooltip'\n"
+        "\n"
+        "screen trait_list_tooltip(traits, given_align = (0.0, 0.0)):\n"
+        "    text 'second tooltip'\n"
+        "\n"
+        "label visit:\n"
+        "    show screen trait_list_tooltip([1, 2], given_align = (0.25, 0.45))\n"
+        "    return\n"
+    )
+    idx.refresh()
+    out = parse(await reg.call("find_undefined_screens", {}))
+    assert out["count"] == 0
+
+
 # ---------- find_unreachable_labels --------------------------------------------
 
 

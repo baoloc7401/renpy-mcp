@@ -47,7 +47,7 @@ _WARP_TEMP_REL = "game/_ide_after_warp.rpy"
 _DRAFTING_REL = "game/_ide_drafting.rpy"
 _AFTER_WARP_LABEL = "after_warp"
 
-_preview_proc: asyncio.subprocess.Process | None = None
+_preview_proc: asyncio.subprocess.Process | renpy_sdk.ThreadedProcess | None = None
 _warp_temp_active: bool = False
 _atexit_registered = False
 
@@ -95,7 +95,7 @@ def _launch_preview(config: ServerConfig) -> ToolDef:
             return _ok({"already_running": True, "pid": _preview_proc.pid})
 
         cmd = [str(config.sdk_root / sdk_launcher_name()), str(config.project_root)]
-        proc = await asyncio.create_subprocess_exec(
+        proc = await renpy_sdk.create_subprocess(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -294,7 +294,7 @@ def _warp_to(config: ServerConfig, index: ProjectIndex) -> ToolDef:
             "--warp",
             label_name,
         ]
-        proc = await asyncio.create_subprocess_exec(
+        proc = await renpy_sdk.create_subprocess(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -503,7 +503,7 @@ def _generate_translation_scaffolding(
                 config.sdk_root, config.project_root, "translate", language
             )
         except Exception as exc:  # noqa: BLE001 — surface as a structured error
-            return _err(f"failed to invoke renpy.sh translate: {exc}")
+            return _err(f"failed to invoke {sdk_launcher_name()} translate: {_describe(exc)}")
         # Ren'Py wrote new .rpy files; re-snapshot the index so subsequent
         # reads (find_stale_translations, get_translation_coverage) see them.
         index.refresh()
@@ -625,7 +625,7 @@ def _build_distribution(config: ServerConfig) -> ToolDef:
                 timeout=600.0,
             )
         except Exception as exc:  # noqa: BLE001
-            return _err(f"failed to invoke renpy.sh distribute: {exc}")
+            return _err(f"failed to invoke {sdk_launcher_name()} distribute: {_describe(exc)}")
 
         # Surface every .zip / .bz2 inside the snapshot root whose
         # mtime advanced after the build started. This catches both
@@ -693,3 +693,10 @@ def _err(message: str) -> list[types.TextContent]:
 
 def _ok(payload: Any) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+
+def _describe(exc: Exception) -> str:
+    """Render an exception for an error payload, falling back to its type
+    name when `str(exc)` is empty (e.g. a bare `NotImplementedError()`)."""
+    text = str(exc)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__

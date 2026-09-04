@@ -267,11 +267,20 @@ def build_app(project_root: Path, sdk_root: Path, static_dir: Path | None = None
         version="0.1.0",
         lifespan=_make_lifespan(project_root, sdk_root),
     )
+    # This API can write project files and spawn the Ren'Py preview process,
+    # so it must not accept requests from arbitrary web origins. The Vite
+    # dev server (5173) proxies `/api`/`/ws` to this backend same-origin; in
+    # production the built frontend is served by this same app (see the
+    # static-mount below), so no cross-origin access is actually needed —
+    # this allowlist only covers the dev-server-open-in-a-separate-tab case.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # local dev only
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=[
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+        ],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=["Content-Type"],
     )
 
     # ---------- read endpoints ----------
@@ -317,7 +326,11 @@ def build_app(project_root: Path, sdk_root: Path, static_dir: Path | None = None
 
     @app.get("/api/lint")
     async def lint() -> Any:
-        return await state.client.call("get_lint_report")
+        # The frontend's own `lib/lint.ts` parses `stdout` client-side, so
+        # it needs the include_raw escape hatch — the default response
+        # (patterns grouped by message, no raw stdout) is for MCP callers,
+        # not this endpoint.
+        return await state.client.call("get_lint_report", {"include_raw": True})
 
     # ---------- write endpoints ----------
 

@@ -7,6 +7,7 @@ returns a single TextContent containing pretty-printed JSON.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Any
 import mcp.types as types
 
 from .. import sdk as renpy_sdk
-from ..config import ServerConfig
+from ..config import ServerConfig, sdk_launcher_name
 from ..project.asset_refs import collect_missing_image_refs
 from ..project.canvas import CanvasError, read_positions
 from ..project.diagnostics import DiagnosticsError, filter_diagnostics, read_ignored
@@ -25,9 +26,10 @@ from ..project.label_tree import (
     parse_label_body,
     parse_label_from_disk,
 )
-from ..project.lint_parse import parse_lint_output
+from ..project.lint_parse import aggregate_findings, parse_lint_output
 from ..project.media import MEDIA_INVARIANTS
 from ..project import scaffold_status
+from ..project.scaffold import scaffold_project
 from ..project import recent as recent_buffer
 from ..project.translations import (
     coverage_summary,
@@ -72,6 +74,7 @@ def register(registry: ToolRegistry, config: ServerConfig, index: ProjectIndex) 
     registry.add(_find_unreachable_labels(config, index))
     registry.add(_read_ignored_diagnostics(config))
     registry.add(_refresh_project(index))
+    registry.add(_bind_project(config, index))
     registry.add(_get_choice_graph(config, index))
     registry.add(_get_translation_coverage(config))
     registry.add(_find_stale_translations(config))
@@ -703,12 +706,20 @@ def _get_lint_report(config: ServerConfig) -> ToolDef:
         "properties": {
             "include_raw": {
                 "type": "boolean",
-                "default": True,
+                "default": False,
                 "description": (
-                    "Include the raw lint stdout/stderr alongside the parsed "
-                    "findings. Default true — some agents prefer to see the "
-                    "original text. Set false to shrink the response when "
-                    "iterating fast."
+                    "Escape hatch for the full ungrouped view: include the "
+                    "flat `findings` list (one entry per line Ren'Py "
+                    "flagged, uncapped) plus the raw stdout/stderr. Default "
+                    "false — a project with a widespread lint pattern (e.g. "
+                    "one dynamic say-tag flagged on every line it's used) "
+                    "can produce tens of thousands of findings that are "
+                    "almost entirely one repeated message, which blows past "
+                    "any reasonable response size. The default response "
+                    "already carries the same information grouped into "
+                    "`patterns` (counts + a few examples each); reach for "
+                    "`include_raw: true` only when you need every single "
+                    "location, not just a representative sample."
                 ),
             },
         },
@@ -716,11 +727,11 @@ def _get_lint_report(config: ServerConfig) -> ToolDef:
     }
 
     async def handler(arguments: dict[str, Any]) -> list[types.TextContent]:
-        include_raw: bool = bool(arguments.get("include_raw", True))
+        include_raw: bool = bool(arguments.get("include_raw", False))
         try:
             result = await renpy_sdk.run_lint(config.sdk_root, config.project_root)
         except Exception as exc:
-            return _err(f"failed to invoke renpy.sh lint: {exc}")
+            return _err(f"failed to invoke {sdk_launcher_name()} lint: {_describe(exc)}")
 
         parsed = parse_lint_output(result.stdout)
         # `clean` is the most actionable bit: agents can early-exit
@@ -728,17 +739,21 @@ def _get_lint_report(config: ServerConfig) -> ToolDef:
         # `returncode == 0` because Ren'Py exits 0 even with warnings.
         summary = parsed["summary"] or {"errors": 0, "warnings": 0, "info": 0, "obsolete": 0}
         clean = summary.get("errors", 0) == 0 and summary.get("warnings", 0) == 0
+        aggregated = aggregate_findings(parsed["findings"])
 
         payload: dict[str, Any] = {
             "returncode": result.returncode,
             "clean": clean,
-            "findings": parsed["findings"],
             "findings_count": len(parsed["findings"]),
+            "patterns": aggregated["patterns"],
+            "pattern_count": aggregated["pattern_count"],
+            "patterns_truncated": aggregated["truncated"],
             "advisories": parsed["advisories"],
             "summary": summary,
             "summary_line": parsed["summary_line"],
         }
         if include_raw:
+            payload["findings"] = parsed["findings"]
             payload["stdout"] = result.stdout
             payload["stderr"] = result.stderr
             payload["statistics"] = parsed["statistics"]
@@ -747,15 +762,25 @@ def _get_lint_report(config: ServerConfig) -> ToolDef:
     return ToolDef(
         name="get_lint_report",
         description=(
-            "Run Ren'Py's built-in `lint` command and return both the parsed "
-            "findings (`{rule, severity, file, line, message}` — same shape as "
-            "the `find_*` diagnostics) and the raw stdout/stderr. The top-level "
+            "Run Ren'Py's built-in `lint` command and return the findings "
+            "grouped by normalized message pattern (quoted substrings — "
+            "character names, file paths — replaced with a placeholder, so "
+            "`Could not evaluate 'jennifer' in the who part...` and "
+            "`Could not evaluate 'erica' in the who part...` collapse into "
+            "one entry). Each `patterns` entry carries `{pattern, rule, "
+            "severity, count, examples}` — up to 5 concrete `{file, line, "
+            "message}` locations — sorted most-severe-then-most-common "
+            "first, capped at 40 patterns (`patterns_truncated: true` + "
+            "`pattern_count` when there are more). `findings_count` is the "
+            "true total finding count even when grouped. The top-level "
             "`clean` field flips True when there are zero errors AND zero "
             "warnings — agents use it to early-exit a fix loop. Severity is "
-            "inferred from message wording (lint itself does not tag findings). "
-            "Slow (a couple of seconds for small projects); call after writes "
-            "or when investigating runtime issues, not as a routine probe. Pass "
-            "`include_raw: false` to skip the raw stdout/stderr."
+            "inferred from message wording (lint itself does not tag "
+            "findings). Slow (a couple of seconds for small projects); call "
+            "after writes or when investigating runtime issues, not as a "
+            "routine probe. Pass `include_raw: true` for the uncapped, "
+            "ungrouped `findings` list plus raw stdout/stderr — only needed "
+            "when a representative sample of each pattern isn't enough."
         ),
         input_schema=schema,
         handler=handler,
@@ -822,6 +847,7 @@ def _diag_payload(
     config: ServerConfig,
     rule: str,
     diagnostics: list[dict[str, Any]],
+    extra: dict[str, Any] | None = None,
 ) -> list[types.TextContent]:
     try:
         ignored = read_ignored(config).ignored
@@ -829,24 +855,26 @@ def _diag_payload(
         # Malformed sidecar shouldn't crash a diagnostic call; surface it as
         # a meta-warning so the agent can fix or wipe the sidecar, but still
         # return the unfiltered diagnostics so they're not invisible.
-        return _ok(
-            {
-                "rule": rule,
-                "diagnostics": diagnostics,
-                "count": len(diagnostics),
-                "suppressed_count": 0,
-                "sidecar_warning": str(exc),
-            }
-        )
-    kept, suppressed = filter_diagnostics(diagnostics, ignored)
-    return _ok(
-        {
+        body: dict[str, Any] = {
             "rule": rule,
-            "diagnostics": kept,
-            "count": len(kept),
-            "suppressed_count": suppressed,
+            "diagnostics": diagnostics,
+            "count": len(diagnostics),
+            "suppressed_count": 0,
+            "sidecar_warning": str(exc),
         }
-    )
+        if extra:
+            body.update(extra)
+        return _ok(body)
+    kept, suppressed = filter_diagnostics(diagnostics, ignored)
+    body = {
+        "rule": rule,
+        "diagnostics": kept,
+        "count": len(kept),
+        "suppressed_count": suppressed,
+    }
+    if extra:
+        body.update(extra)
+    return _ok(body)
 
 
 def _walk_label_tree(config: ServerConfig, label: LabelInfo) -> dict[str, Any]:
@@ -897,12 +925,116 @@ def _find_invalid_jumps(config: ServerConfig, index: ProjectIndex) -> ToolDef:
     )
 
 
+# Both character diagnostics need to know "is this say-tag bound to
+# *something*", not just "is it `define x = Character(...)`" — plenty of
+# real projects build characters through a custom class (e.g. a `Person`
+# subclass) and never write the literal `Character(` shape the scanner's
+# `CharacterInfo` model looks for. When that registry comes back empty,
+# every single say-statement in the project looks "undefined" at once,
+# which is both wrong and, on a large project, big enough to blow past
+# the tool-output size limit. `_known_character_names` widens the net
+# (still heuristic, but zero-cost or cheap) and both tools short-circuit
+# with an explicit low-confidence warning when even the widened set is
+# empty, rather than silently emitting either a false-positive flood or a
+# falsely-clean empty result.
+_UNDEFINED_CHARACTER_LIMIT = 200
+
+
+def _character_factory_names(config: ServerConfig) -> set[str]:
+    """Best-effort scan of `*_ren.py` files for top-level name bindings.
+
+    `_ren.py` files are plain Python, executed at init time — projects
+    that build characters programmatically (a factory function, a custom
+    class) typically bind the result to a module-level name in one of
+    these files, e.g. `jennifer = create_jennifer_character()`. We can't
+    know which top-level names are actually characters without executing
+    the file, so every top-level assignment target is a candidate: this
+    set is only ever used to avoid false positives below, never to
+    manufacture new findings, so over-including a non-character name here
+    is harmless. Files that don't parse as Python are skipped, not fatal.
+    """
+    names: set[str] = set()
+    game_dir = config.project_root / "game"
+    if not game_dir.is_dir():
+        return names
+    for py_file in sorted(game_dir.rglob("*_ren.py")):
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        for node in tree.body:
+            targets: list[ast.expr] = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+    return names
+
+
+def _known_character_names(config: ServerConfig, snap: ProjectSnapshot) -> dict[str, Any]:
+    """Union every source of "this name is a bound character/say-tag" this
+    server can see, plus a per-source breakdown for the low-confidence
+    warning when even the union is empty."""
+    from_character_defs = {c.var_name for c in snap.characters}
+    from_rpy_vars = {v.name for v in snap.defines} | {v.name for v in snap.defaults}
+    from_py_factories = _character_factory_names(config)
+    return {
+        "names": from_character_defs | from_rpy_vars | from_py_factories,
+        "from_character_defs": len(from_character_defs),
+        "from_rpy_defines_defaults": len(from_rpy_vars),
+        "from_python_factory_files": len(from_py_factories),
+    }
+
+
+def _low_confidence_character_warning(known: dict[str, Any], tool_name: str) -> str:
+    return (
+        "no character bindings found by any heuristic this server uses — "
+        "not `define x = Character(...)` "
+        f"({known['from_character_defs']} found), not any other "
+        f"`define`/`default` ({known['from_rpy_defines_defaults']} found), "
+        "not a top-level name in a `*_ren.py` file "
+        f"({known['from_python_factory_files']} found). This project may "
+        "define characters in a way this scan can't see (e.g. inside an "
+        f"`init python:` block); `{tool_name}` results are unreliable and "
+        "have been skipped rather than guessing."
+    )
+
+
 def _find_undefined_characters(config: ServerConfig, index: ProjectIndex) -> ToolDef:
     schema = {"type": "object", "properties": {}, "additionalProperties": False}
 
     async def handler(_arguments: dict[str, Any]) -> list[types.TextContent]:
         snap = index.snapshot()
-        defined = {c.var_name for c in snap.characters}
+        known = _known_character_names(config, snap)
+        if not snap.characters:
+            # Same trigger as `find_unused_characters`: zero literal
+            # `define x = Character(...)` definitions. Using the widened
+            # union (`known["names"]`: defines/defaults/`*_ren.py` names)
+            # here instead would under-trigger: a project can have plenty
+            # of factory-bound names in that union yet still route dialogue
+            # through a generic reassigned variable (`the_person = erica`
+            # ... later `the_person "..."`) that no static scan can
+            # resolve — one such name then floods the response with
+            # thousands of identical false positives. An empty
+            # `Character()` registry is the reliable "this project's cast
+            # isn't declared in a shape this tool can check" signal, so
+            # bail out on it alone.
+            return _diag_payload(
+                config,
+                "undefined_character",
+                [],
+                extra={
+                    "low_confidence": True,
+                    "warning": _low_confidence_character_warning(
+                        known, "find_undefined_characters"
+                    ),
+                },
+            )
+
+        defined = known["names"]
         diagnostics: list[dict[str, Any]] = []
         for label in snap.labels:
             tree = _walk_label_tree(config, label)
@@ -925,16 +1057,48 @@ def _find_undefined_characters(config: ServerConfig, index: ProjectIndex) -> Too
                         ).format(who=who),
                     }
                 )
-        return _diag_payload(config, "undefined_character", diagnostics)
+
+        total_found = len(diagnostics)
+        extra: dict[str, Any] | None = None
+        if total_found > _UNDEFINED_CHARACTER_LIMIT:
+            diagnostics = diagnostics[:_UNDEFINED_CHARACTER_LIMIT]
+            extra = {
+                "truncated": True,
+                "total_found": total_found,
+                "warning": (
+                    f"{total_found} undefined-character findings — truncated "
+                    f"to the first {_UNDEFINED_CHARACTER_LIMIT}. This many is "
+                    "usually a sign the character registry is incomplete "
+                    "(see `from_character_defs` / `from_rpy_defines_defaults` "
+                    "/ `from_python_factory_files` below) rather than a "
+                    "project with hundreds of real typos."
+                ),
+                **{f"registry_{k}": v for k, v in known.items() if k != "names"},
+            }
+        return _diag_payload(config, "undefined_character", diagnostics, extra=extra)
 
     return ToolDef(
         name="find_undefined_characters",
         description=(
             "Walk every label and flag every say-statement whose speaker tag "
-            "is not bound by any `define x = Character(...)`. Narration "
+            "is not bound to a known character. If zero `define x = "
+            "Character(...)` definitions exist anywhere in the project, "
+            "returns zero diagnostics plus `low_confidence: true` and a "
+            "`warning` instead of checking at all — treat that as 'couldn't "
+            "check', not 'all clean'. Some projects build characters via a "
+            "custom class/factory function and never write `Character(` "
+            "literally; that's undetectable by a static scan (the say-tag is "
+            "often a generic variable reassigned per-scene, e.g. `the_person "
+            "= erica`), so it's reported as low-confidence rather than "
+            "guessed at. When at least one real `Character(...)` definition "
+            "exists, the lookup is widened with any other `define`/`default` "
+            "statement and any top-level name assigned in a `*_ren.py` file "
+            "to cut down false positives from mixed-style casts. Narration "
             "(unquoted-name say) is ignored. Severity `error` — Ren'Py's "
             "engine treats undefined character variables as runtime "
-            "NameErrors. Returns the standard diagnostics shape."
+            "NameErrors. Output is capped at 200 findings (`truncated: true` "
+            "+ `total_found` when hit). Returns the standard diagnostics "
+            "shape."
         ),
         input_schema=schema,
         handler=handler,
@@ -946,6 +1110,25 @@ def _find_unused_characters(config: ServerConfig, index: ProjectIndex) -> ToolDe
 
     async def handler(_arguments: dict[str, Any]) -> list[types.TextContent]:
         snap = index.snapshot()
+        if not snap.characters:
+            # Nothing shaped like `define x = Character(...)` exists, so
+            # this tool structurally has nothing to check — an empty
+            # result would look identical to "everyone's used," which is
+            # misleading if the project has a real cast built some other
+            # way. Surface that distinction explicitly.
+            known = _known_character_names(config, snap)
+            return _diag_payload(
+                config,
+                "unused_character",
+                [],
+                extra={
+                    "low_confidence": True,
+                    "warning": _low_confidence_character_warning(
+                        known, "find_unused_characters"
+                    ),
+                },
+            )
+
         speakers: set[str] = set()
         for label in snap.labels:
             tree = _walk_label_tree(config, label)
@@ -980,7 +1163,11 @@ def _find_unused_characters(config: ServerConfig, index: ProjectIndex) -> ToolDe
             "rename that left the old definition behind. Returns the standard "
             "diagnostics shape; each entry points at the character's `define` "
             "line so the agent can either delete the definition or wire up "
-            "missing dialogue."
+            "missing dialogue. Only `Character(...)`-shaped definitions can be "
+            "checked this way; if none exist, returns zero diagnostics plus "
+            "`low_confidence: true` and a `warning` instead of a falsely-clean "
+            "empty result — the project may build its cast some other way "
+            "(check `find_undefined_characters`' registry breakdown)."
         ),
         input_schema=schema,
         handler=handler,
@@ -1070,14 +1257,22 @@ def _find_undefined_screens(config: ServerConfig, index: ProjectIndex) -> ToolDe
         for label in snap.labels:
             tree = _walk_label_tree(config, label)
             for stmt in iter_statements(tree["body"]):
-                screen_name: str | None = None
+                screen_ref: str | None = None
                 if stmt["kind"] == "show" and stmt["expression"].startswith("screen "):
-                    screen_name = _first_word(stmt["expression"][len("screen ") :])
+                    screen_ref = stmt["expression"][len("screen ") :].strip()
                 elif stmt["kind"] == "call" and stmt["target"] == "screen":
-                    rest = stmt.get("rest") or ""
-                    screen_name = _first_word(rest) if rest else None
+                    screen_ref = (stmt.get("rest") or "").strip() or None
+                screen_name = _screen_ref_name(screen_ref) if screen_ref else None
                 if not screen_name or screen_name in defined:
                     continue
+                # The full reference (call args and all) is only for
+                # message context — `screen_name` (the bare identifier
+                # before any `(`) is the actual lookup key.
+                context = (
+                    f" (referenced as `{_truncate(screen_ref, 80)}`)"
+                    if screen_ref and screen_ref != screen_name
+                    else ""
+                )
                 diagnostics.append(
                     {
                         "rule": "undefined_screen",
@@ -1087,7 +1282,7 @@ def _find_undefined_screens(config: ServerConfig, index: ProjectIndex) -> ToolDe
                         "label": label.name,
                         "message": (
                             f"screen `{screen_name}` is referenced but never "
-                            "declared with `screen ...:`"
+                            f"declared with `screen ...:`{context}"
                         ),
                     }
                 )
@@ -1383,6 +1578,88 @@ def _refresh_project(index: ProjectIndex) -> ToolDef:
     )
 
 
+# ---------- bind_project ---------------------------------------------------------
+
+
+def _bind_project(config: ServerConfig, index: ProjectIndex) -> ToolDef:
+    schema = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": (
+                    "Absolute (or cwd-relative) path to an EXISTING Ren'Py "
+                    "project root — the directory that directly contains "
+                    "`game/script.rpy`. Does not need to live under the "
+                    "server's games root or follow a `<slug>/` layout; any "
+                    "directory on disk works, including a large pre-existing "
+                    "repo whose game lives at `<repo_root>/game/`."
+                ),
+            },
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+    async def handler(arguments: dict[str, Any]) -> list[types.TextContent]:
+        raw_path: str = arguments["path"]
+        root = Path(raw_path).expanduser().resolve()
+
+        if not root.is_dir():
+            return _err(f"path does not exist or is not a directory: {root}")
+        if not (root / "game" / "script.rpy").is_file():
+            return _err(
+                f"no `game/script.rpy` under {root} — `bind_project` only "
+                "binds to a project that's already scaffolded. To create a "
+                "new one, use `new_project` instead."
+            )
+
+        # Reuses `new_project`'s idempotent scaffold check: since
+        # `game/script.rpy` already exists, this is a no-op that just
+        # confirms `game/images` and `game/audio` are present.
+        summary = scaffold_project(root, sdk_root=config.sdk_root)
+        config.bind_project(root)
+        snap = index.refresh()
+
+        return _ok(
+            {
+                "summary": summary,
+                "project_root": str(root),
+                "bound": True,
+                "counts": {
+                    "files": len(snap.files),
+                    "labels": len(snap.labels),
+                    "characters": len(snap.characters),
+                    "images": len(snap.images),
+                },
+                "next_steps": [
+                    "Call get_project_overview to confirm the bind picked up "
+                    "the expected file/label/character counts.",
+                    "Call get_scaffold_status for a freshness readout.",
+                ],
+            }
+        )
+
+    return ToolDef(
+        name="bind_project",
+        description=(
+            "Bind this session to an EXISTING Ren'Py project directory "
+            "anywhere on disk — no games-root or `<slug>/` layout required. "
+            "Unlike `new_project` (which creates-or-binds a project under "
+            "the server's games root), this tool never scaffolds: it errors "
+            "if `<path>/game/script.rpy` isn't already there, pointing you "
+            "at `new_project` instead. Use this when the server's default "
+            "`<cwd>/games/<slug>/` convention doesn't match where the real "
+            "project lives — e.g. a large existing repo whose Ren'Py game "
+            "sits directly at `<repo_root>/game/`. Rebinding replaces every "
+            "subsequent tool call's project root in place; the server stays "
+            "the same process."
+        ),
+        input_schema=schema,
+        handler=handler,
+    )
+
+
 # ---------- get_recent_edits ----------------------------------------------------
 
 
@@ -1488,12 +1765,25 @@ def _get_media_invariants() -> ToolDef:
 # ---------- helpers -------------------------------------------------------------
 
 
-def _first_word(text: str) -> str:
-    """Return the first whitespace-separated token, or "" for empty input."""
+def _truncate(text: str, limit: int) -> str:
+    """Shorten `text` for a diagnostic message, marking the cut with `...`."""
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+_SCREEN_IDENTIFIER_RE = re.compile(r"^([A-Za-z_]\w*)")
+
+
+def _screen_ref_name(text: str) -> str | None:
+    """Extract the bare screen identifier from a `show screen X(...)` /
+    `call screen X(...)` reference — the name Ren'Py actually looks up.
+    Stops at the first non-identifier character, so call arguments (which
+    may run on well past the name, including into a `(...)` that spans
+    multiple physical lines) are never mistaken for part of the name."""
     text = text.strip()
     if not text:
-        return ""
-    return text.split()[0]
+        return None
+    m = _SCREEN_IDENTIFIER_RE.match(text)
+    return m.group(1) if m else None
 
 
 def _label_dict(label: LabelInfo) -> dict[str, Any]:
@@ -1549,3 +1839,10 @@ def _err(message: str, **extra: Any) -> list[types.TextContent]:
     body: dict[str, Any] = {"error": message}
     body.update(extra)
     return [types.TextContent(type="text", text=json.dumps(body, indent=2, ensure_ascii=False))]
+
+
+def _describe(exc: Exception) -> str:
+    """Render an exception for an error payload, falling back to its type
+    name when `str(exc)` is empty (e.g. a bare `NotImplementedError()`)."""
+    text = str(exc)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__

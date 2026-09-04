@@ -25,7 +25,7 @@ def config() -> ServerConfig:
 
 @pytest.fixture
 def registry(config: ServerConfig) -> ToolRegistry:
-    reg = ToolRegistry()
+    reg = ToolRegistry(config)
     tier1_read.register(reg, config, ProjectIndex(config))
     return reg
 

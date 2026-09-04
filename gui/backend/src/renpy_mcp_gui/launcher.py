@@ -281,17 +281,39 @@ def _print_progress(label: str, done: int, total: int, started: float) -> None:
     sys.stdout.flush()
 
 
+def _reject_path_traversal(member_name: str, into: Path) -> Path:
+    """Return `member_name`'s extraction target, refusing escapes from `into`.
+
+    Standard `extractall()` is unsafe against a maliciously crafted archive
+    — entries with `../` or absolute paths can write outside the extract
+    root. We trust renpy.org but still gate paths so a single misbehaving
+    release (or a MITM'd download) can't escape `into`. Mirrors
+    `renpy_mcp.project.sdk_fetch._safe_extract`.
+    """
+    target = (into / member_name).resolve()
+    into_resolved = into.resolve()
+    if target != into_resolved and not str(target).startswith(str(into_resolved) + os.sep):
+        raise RuntimeError(f"refusing path-traversal entry: {member_name!r}")
+    return target
+
+
 def extract_sdk_archive(archive: Path, into: Path) -> Path:
     """Extract archive into `into/`, return the SDK root directory inside it."""
     into.mkdir(parents=True, exist_ok=True)
     if archive.suffix == ".zip":
         with zipfile.ZipFile(archive) as z:
+            for name in z.namelist():
+                _reject_path_traversal(name, into)
             z.extractall(into)
     else:
         # tarfile auto-detects bz2/gzip from the file's extension or magic.
         with tarfile.open(archive) as t:
-            # Python 3.12+ supports `filter=` for safe extraction. Older
-            # interpreters would have warned.
+            for member in t.getmembers():
+                _reject_path_traversal(member.name, into)
+            # Python 3.12+ also supports `filter=` as defense-in-depth
+            # (blocks device files, symlink tricks, permission bits, etc.
+            # beyond plain path containment). Older interpreters fall back
+            # to the manual check above, which already covers path escape.
             try:
                 t.extractall(into, filter="data")
             except TypeError:

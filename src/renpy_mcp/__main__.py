@@ -50,6 +50,56 @@ def _default_sdk() -> Path | None:
     return cached.resolve() if cached else None
 
 
+def resolve_project_root(
+    *,
+    explicit_project: Path | None,
+    cwd: Path,
+    games_root: Path,
+    sdk_root: Path,
+    log: logging.Logger,
+) -> Path | None:
+    """Resolve `project_root` for startup — WITHOUT ever writing to disk on
+    its own initiative. Returns ``None`` when nothing should be bound yet;
+    the caller is responsible for leaving the server in an explicitly
+    unbound state in that case (see ``main()``).
+
+    Priority, highest first:
+        1. ``explicit_project`` (already merged from ``--project`` /
+           $RENPY_MCP_PROJECT_ROOT by the caller — ``--project`` wins if
+           both are set). Binds directly to that path, no games_root
+           shaping required; scaffolds it in place if not already a
+           project. This is a deliberate, user-specified target — the one
+           case where scaffolding here is still appropriate, because the
+           operator explicitly named this exact path.
+        2. ``cwd`` itself, when it's already a Ren'Py project root
+           (``cwd/game/script.rpy`` exists) — covers launching the server
+           from inside an existing project's checkout with no flags. No
+           write happens: the project is already there.
+        3. Otherwise: ``None``. The server starts unbound rather than
+           silently scaffolding ``games_root/default/`` under whatever
+           directory happened to be ``cwd`` — that behavior used to fire
+           in *any* directory the server was launched from, including
+           ones with no relation to Ren'Py at all, writing real files into
+           unrelated git repos with no user action and no audit trail.
+           Binding now requires an explicit ``new_project``/`bind_project`
+           tool call (or ``--project``/`$RENPY_MCP_PROJECT_ROOT`` next
+           startup) — every tool but those two reports "no project bound"
+           until then.
+    """
+    if explicit_project is not None:
+        project_root = explicit_project.resolve()
+        if not (project_root / "game" / "script.rpy").is_file():
+            summary = scaffold_project(project_root, sdk_root=sdk_root)
+            log.info("startup: %s", summary)
+        return project_root
+
+    if (cwd / "game" / "script.rpy").is_file():
+        log.info("startup: binding directly to existing project at cwd: %s", cwd)
+        return cwd
+
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="renpy-mcp")
     parser.add_argument(
@@ -57,10 +107,14 @@ def main() -> int:
         type=Path,
         default=None,
         help=(
-            "Path to a Ren'Py project root (the dir containing game/). "
-            "Optional: if omitted, defaults to "
-            f"`<cwd>/{DEFAULT_GAMES_SUBDIR}/{DEFAULT_PROJECT_SLUG}/` and is "
-            "auto-scaffolded when missing."
+            "Path to a Ren'Py project root (the dir containing game/) — "
+            "any directory, not just one under --games-root. Also settable "
+            "via $RENPY_MCP_PROJECT_ROOT (this flag wins if both are set). "
+            "Optional: if omitted and $RENPY_MCP_PROJECT_ROOT is unset, the "
+            "server binds directly to <cwd> when <cwd>/game/script.rpy "
+            "already exists; otherwise it starts UNBOUND (no directory is "
+            "created automatically) until an agent calls `new_project` or "
+            "`bind_project`."
         ),
     )
     parser.add_argument(
@@ -137,11 +191,31 @@ def main() -> int:
         )
         return 2
 
-    project_root = (args.project or (games_root / DEFAULT_PROJECT_SLUG)).resolve()
-    if not (project_root / "game").is_dir():
-        games_root.mkdir(parents=True, exist_ok=True)
-        summary = scaffold_project(project_root, sdk_root=sdk_root.resolve())
-        log.info("startup: %s", summary)
+    env_project = os.environ.get("RENPY_MCP_PROJECT_ROOT")
+    explicit_project = args.project or (Path(env_project) if env_project else None)
+
+    project_root = resolve_project_root(
+        explicit_project=explicit_project,
+        cwd=cwd,
+        games_root=games_root,
+        sdk_root=sdk_root.resolve(),
+        log=log,
+    )
+    bound = project_root is not None
+    if not bound:
+        # Unbound: `ServerConfig.project_root` still needs *some* Path (the
+        # field isn't Optional), but this one is a placeholder that is
+        # never created here — nothing on this branch touches disk. It
+        # only becomes real if an agent later calls `new_project` (which
+        # scaffolds under `games_root`) or `bind_project` (which points
+        # `project_root` somewhere else entirely).
+        project_root = (games_root / DEFAULT_PROJECT_SLUG).resolve()
+        log.info(
+            "startup: no --project/$RENPY_MCP_PROJECT_ROOT given and cwd is "
+            "not a Ren'Py project; starting UNBOUND. Every tool but "
+            "new_project/bind_project will report 'no project bound' until "
+            "one of them is called — nothing is written to disk yet."
+        )
 
     config = ServerConfig(
         project_root=project_root,
@@ -150,7 +224,7 @@ def main() -> int:
         games_root=games_root,
     )
     try:
-        config.validate()
+        config.validate(require_project=bound)
     except ValueError as exc:
         log.error("startup: %s", exc)
         return 2
