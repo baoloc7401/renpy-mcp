@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Code Generators",
 ]
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.2.0,<2.0.0",
     "pydantic>=2.0",
     "unidiff>=0.7",
 ]
